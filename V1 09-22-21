@@ -1,0 +1,488 @@
+WITH devices AS
+	(
+
+		SELECT
+			DISTINCT
+			UPPER(device_id)    AS s
+				   ,   fact_game_device_install.game_name
+				   ,   fact_game_device_install.platform
+				   ,   'Remerge'   AS  campaign_channel
+				   ,   grp
+				   ,   CASE
+					       WHEN    remerge_devices.campaign_name = 'Android_Q12021_Ongoing' AND remerge_devices.game_name =   'CovetFashion'
+						       THEN    'CF_Android_ALL_Both_Video_AEO_Feb2021_Lapsed_CID23719'
+					       WHEN    remerge_devices.campaign_name = 'iOS_Q12021_Ongoing' AND remerge_devices.game_name =   'CovetFashion'
+						       THEN    'CF_iOS_ALL_Both_Video_Feb2021_Lapsed_CID23718'
+			END     AS campaign_name -- update the campaign name to match to the other source tables - spend_data_raw and singular_clicks_orc
+
+		FROM
+			glu.adhoc.remerge_devices
+				INNER JOIN
+			glu.dwh_dev.fact_game_device_install
+			ON
+				(       UPPER(remerge_devices.device_id)    =   fact_game_device_install.s
+					AND    remerge_devices.game_name            =   fact_game_device_install.game
+					AND    UPPER(remerge_devices.platform)     =   fact_game_device_install.platform
+					)
+
+		WHERE
+				remerge_devices.campaign_name IN ('Android_Q12021_Ongoing','iOS_Q12021_Ongoing') -- campaign name in remerge devices table -- shamanth gave the name of campaign
+		  AND remerge_devices.game_name =     'CovetFashion' --- game name
+		  AND date_sent_to_remerge BETWEEN    DATE('2021-06-01') AND  DATE('2021-06-30') -- campaign dates
+	), players_group AS
+   (
+
+SELECT
+	game_name
+		,   platform
+		,   campaign_channel
+		,   campaign_name
+		,   SUM(CASE
+	WHEN grp = 'TEST'
+	THEN 1
+	ELSE 0
+	END) AS number_of_players_in_test_grp
+		,   SUM(CASE
+	WHEN grp = 'CONTROL'
+	THEN 1
+	ELSE 0
+	END) AS number_of_players_in_control_grp
+FROM
+	devices
+
+GROUP BY
+	1,2,3,4
+
+	),
+	snapshot_users
+	AS
+	(
+SELECT
+	devices.s
+		,   devices.campaign_name
+		,   devices.game_name
+		,   devices.platform
+		,   devices.campaign_channel
+		,   devices.grp
+		,   MIN(first_session_date) first_session_date
+FROM
+	devices
+
+	LEFT OUTER JOIN
+	(SELECT
+	s
+		,   game_name
+		,   MIN(the_date) AS first_session_date
+	FROM
+	glu.adrift.game_device_daily_snapshot
+	WHERE
+	the_date BETWEEN DATE('2021-06-01') AND  DATEADD(DAY,6,DATE('2021-06-30'))
+	GROUP BY
+	1,2
+	) AS snapshot
+ON
+	devices.s           =   snapshot.s
+	AND devices.game_name   =   snapshot.game_name
+group by 1,2,3,4,5,6
+	)
+		,
+	device_clicks AS
+	(
+SELECT
+	s
+		,   campaign_name
+		,   game_name
+		,   platform
+		,   campaign_channel
+		,   grp
+		,   has_click
+	-- ,   LEAST(COALESCE(first_session_date ,first_click_date), COALESCE(first_click_date , first_session_date)) AS  first_activity_date  -- which is correct?
+		,   COALESCE(first_click_date , first_session_date) AS  first_activity_date
+		,   first_session_date
+		,   first_click_date
+FROM(
+	SELECT
+	snapshot_users.s
+		,   snapshot_users.campaign_name
+		,   snapshot_users.game_name
+		,   snapshot_users.platform
+		,   snapshot_users.campaign_channel
+		,   snapshot_users.grp
+		,   CASE WHEN clicks.s IS NOT NULL THEN 1 ELSE 0 END AS has_click
+		,   MIN(first_session_date)     AS first_session_date
+		,   MIN(first_click_date)       AS  first_click_date
+	FROM
+	snapshot_users
+
+	LEFT OUTER JOIN
+
+	( SELECT
+	UPPER(device_id) AS s
+		,   campaign_name
+		,   MIN(DATE(timestamp))    AS  first_click_date
+
+	FROM
+	glu.adjust.singular_clicks_orc clicks
+
+
+	WHERE
+	clicks.campaign_name IN (
+	'CF_Android_ALL_Both_Video_AEO_Feb2021_Lapsed_CID23719'
+		,   'CF_iOS_ALL_Both_Video_Feb2021_Lapsed_CID23718') --- change campaign name
+	AND DATE(timestamp) BETWEEN DATE('2021-06-01') AND  DATE('2021-06-30') -- change the dates here
+
+	GROUP BY
+	1,2
+	) AS clicks
+	ON
+	snapshot_users.s=clicks.s
+	AND
+	clicks.campaign_name=snapshot_users.campaign_name
+	GROUP BY 1,2,3,4,5,6,7
+	)) ,
+	reengaged_users AS
+	(   SELECT
+	game_name
+		,   platform
+		,   campaign_channel
+		,   campaign_name
+		,   SUM(CASE
+	WHEN grp = 'TEST'
+	THEN has_click
+	ELSE 0
+	END) AS number_of_test_users_with_clicks
+		,   SUM(CASE
+	WHEN grp = 'CONTROL'
+	THEN has_click
+	ELSE 0
+	END) AS number_of_control_users_with_clicks
+		,   SUM(CASE
+	WHEN grp = 'TEST'
+	THEN 1
+	ELSE 0
+	END) AS number_of_test_reengaged_users
+		,   SUM(CASE
+	WHEN grp = 'CONTROL'
+	THEN 1
+	ELSE 0
+	END) AS number_of_control_reengaged_users
+FROM
+	device_clicks
+WHERE
+	first_activity_date is NOT NULL
+GROUP BY
+	1,2,3,4
+	)
+		,
+	revenue_d1 AS
+	(
+SELECT
+	device_clicks.campaign_name
+		,   device_clicks.game_name
+		,   device_clicks.platform
+		,   device_clicks.campaign_channel
+		,   SUM(gross_revenue)              AS          d1_gross_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_revenue)
+	ELSE 0
+	END)                        AS          with_click_d1_gross_revenue
+		,   SUM(net_revenue)                AS          d1_net_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_net_revenue
+		,   SUM(gross_iap_revenue)          AS          d1_gross_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_iap_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_gross_iap_revenue
+		,   SUM(net_iap_revenue)            AS          d1_net_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_iap_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_net_iap_revenue
+		,   SUM(gross_subscription_revenue) AS      d1_gross_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_subscription_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_gross_subscription_revenue
+		,   SUM(net_subscription_revenue)   AS      d1_net_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_subscription_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_net_subscription_revenue
+		,   SUM(gross_offerwall_revenue)    AS      d1_gross_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_offerwall_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_gross_offerwall_revenue
+		,   SUM(net_offerwall_revenue)      AS      d1_net_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_offerwall_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_net_offerwall_revenue
+		,   SUM(gross_ad_revenue)           AS      d1_gross_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_ad_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_gross_ad_revenue
+		,   SUM(net_ad_revenue)             AS      d1_net_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_ad_revenue)
+	ELSE 0
+	END)                        AS      with_click_d1_net_ad_revenue
+
+FROM
+	device_clicks
+	LEFT OUTER JOIN
+	glu.adrift.game_device_daily_snapshot snapshot
+
+ON
+	device_clicks.s=snapshot.s
+	AND     device_clicks.game_name=snapshot.game_name
+	AND     device_clicks.first_activity_date=snapshot.the_date
+
+
+GROUP BY 1,2,3,4
+	) ,
+	revenue_d7 AS
+	(
+SELECT
+	device_clicks.campaign_name
+		,   device_clicks.game_name
+		,   device_clicks.platform
+		,   device_clicks.campaign_channel
+		,   SUM(gross_revenue)              AS          d7_gross_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_gross_revenue
+		,   SUM(net_revenue)                AS          d7_net_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_net_revenue
+		,   SUM(gross_iap_revenue)          AS          d7_gross_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_iap_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_gross_iap_revenue
+		,   SUM(net_iap_revenue)            AS          d7_net_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_iap_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_net_iap_revenue
+		,   SUM(gross_subscription_revenue) AS          d7_gross_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_subscription_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_gross_subscription_revenue
+		,   SUM(net_subscription_revenue)   AS          d7_net_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_subscription_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_net_subscription_revenue
+		,   SUM(gross_offerwall_revenue)    AS          d7_gross_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_offerwall_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_gross_offerwall_revenue
+		,   SUM(net_offerwall_revenue)      AS          d7_net_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_offerwall_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_net_offerwall_revenue
+		,   SUM(gross_ad_revenue)           AS          d7_gross_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_ad_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_gross_ad_revenue
+		,   SUM(net_ad_revenue)             AS          d7_net_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_ad_revenue)
+	ELSE 0
+	END)                        AS          with_click_d7_net_ad_revenue
+FROM
+	device_clicks
+	LEFT OUTER JOIN
+	glu.adrift.game_device_daily_snapshot snapshot
+
+ON
+	device_clicks.s=snapshot.s
+	AND     device_clicks.game_name=snapshot.game_name
+	AND   snapshot.the_date BETWEEN device_clicks.first_activity_date AND DATEADD(DAY,6,device_clicks.first_activity_date)
+
+GROUP BY 1,2,3,4
+
+	)
+		,revenue_d30 AS
+	(
+SELECT
+	device_clicks.campaign_name
+		,   device_clicks.game_name
+		,   device_clicks.platform
+		,   device_clicks.campaign_channel
+		,   SUM(gross_revenue)              AS          d30_gross_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_gross_revenue
+		,   SUM(net_revenue)                AS          d30_net_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_net_revenue
+		,   SUM(gross_iap_revenue)          AS          d30_gross_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_iap_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_gross_iap_revenue
+		,   SUM(net_iap_revenue)            AS          d30_net_iap_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_iap_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_net_iap_revenue
+		,   SUM(gross_subscription_revenue) AS          d30_gross_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_subscription_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_gross_subscription_revenue
+		,   SUM(net_subscription_revenue)   AS          d30_net_subscription_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_subscription_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_net_subscription_revenue
+		,   SUM(gross_offerwall_revenue)    AS          d30_gross_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_offerwall_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_gross_offerwall_revenue
+		,   SUM(net_offerwall_revenue)      AS          d30_net_offerwall_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_offerwall_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_net_offerwall_revenue
+		,   SUM(gross_ad_revenue)           AS          d30_gross_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (gross_ad_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_gross_ad_revenue
+		,   SUM(net_ad_revenue)             AS          d30_net_ad_revenue
+		,   SUM(CASE
+	WHEN has_click=1
+	THEN (net_ad_revenue)
+	ELSE 0
+	END)                        AS          with_click_d30_net_ad_revenue
+FROM
+	device_clicks
+	LEFT OUTER JOIN
+	glu.adrift.game_device_daily_snapshot snapshot
+
+ON
+	device_clicks.s=snapshot.s
+	AND     device_clicks.game_name=snapshot.game_name
+	AND   snapshot.the_date BETWEEN device_clicks.first_activity_date AND DATEADD(DAY,29,device_clicks.first_activity_date)
+
+GROUP BY 1,2,3,4
+
+	) ,
+	campaigns AS
+	(SELECT
+
+	game_name
+		,   platform
+		,   'Remerge'   AS campaign_channel
+		,   campaign_name
+		,   SUM(raw_spend)      AS  raw_spend
+		,   SUM(impressions)    AS  impressions
+		,   SUM(clicks)         AS  clicks
+		,   SUM(installs)       AS  installs
+
+FROM
+	glu.dwh_dev.ua_spend_data_raw
+	INNER JOIN
+	glu.utility.dim_title
+	USING
+	(game_name)
+WHERE
+
+	cid_key IN (
+	'CID23719'
+	,   'CID23718'
+	) -- update cid_key
+  AND campaign_date BETWEEN DATE('2021-06-01') AND  DATE('2021-06-30') -- update campaign dates
+GROUP BY
+	1,2,3,4)
+SELECT
+	*
+FROM
+	players_group
+		LEFT OUTER JOIN
+	reengaged_users
+	USING
+		(    game_name
+			,    platform
+			,    campaign_channel
+			,    campaign_name
+			)
+		LEFT OUTER JOIN
+	campaigns
+	USING
+		(    game_name
+			,    platform
+			,    campaign_channel
+			,    campaign_name
+			)
+		LEFT OUTER JOIN
+	revenue_d1
+	USING
+		(    game_name
+			,    platform
+			,    campaign_channel
+			,    campaign_name
+			)
+		LEFT OUTER JOIN
+	revenue_d7
+	USING
+		(    game_name
+			,    platform
+			,    campaign_channel
+			,    campaign_name
+			)
+		LEFT OUTER JOIN
+	revenue_d30
+	USING
+		(    game_name
+			,    platform
+			,    campaign_channel
+			,    campaign_name
+			);
