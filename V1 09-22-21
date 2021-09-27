@@ -29,7 +29,22 @@ WITH devices AS
 				remerge_devices.campaign_name IN ('Android_Q12021_Ongoing','iOS_Q12021_Ongoing') -- campaign name in remerge devices table -- shamanth gave the name of campaign
 		  AND remerge_devices.game_name =     'CovetFashion' --- game name
 		  AND date_sent_to_remerge BETWEEN    DATE('2021-06-01') AND  DATE('2021-06-30') -- campaign dates
-	), players_group AS
+	)
+	
+--	 SELECT GRP -- using s and game_name to join snapshot to get revenue
+--    , SUM(CASE WHEN GRP = 'TEST' THEN gross_revenue ELSE 0 END) test_gross_revenue
+--    , SUM(CASE WHEN GRP = 'TEST' THEN net_revenue ELSE 0 END)   test_net_revenue
+--   , SUM(CASE WHEN GRP = 'CONTROL' THEN gross_revenue ELSE 0 END)  cont_gross_revenue
+--    , SUM(CASE WHEN GRP = 'CONTROL' THEN net_revenue ELSE 0 END)  cont_net_revenue
+--   FROM "GLU"."ADRIFT"."GAME_DEVICE_DAILY_SNAPSHOT" snapshot
+--    RIGHT OUTER JOIN
+--    devices
+--    ON snapshot.s = devices.s
+--    AND snapshot.GAME_NAME = devices.GAME_NAME
+--    WHERE THE_DATE between DATE('2021-06-24') AND  DATE('2021-08-31') -- campaign dates
+--    GROUP BY 1 ;
+	
+	, players_group AS
    (
 
 SELECT
